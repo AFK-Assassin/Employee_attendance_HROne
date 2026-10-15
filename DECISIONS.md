@@ -1,108 +1,164 @@
+
 # DECISIONS.md
 
-Here are my answers to the 5 design questions, explaining my thought process, what I implemented, and what I learned along the way.
+Here are my answers to the 6 design questions, explaining my thought process, what I implemented, and what I learned along the way.
 
 ---
 
 ### 1. Indexes. Which indexes did you create, and which query or guarantee does each one serve? Which one did you consider and reject?
 
-Here are the indexes I created in `create_indexes()` on app startup:
+Here are the indexes I created in `create_indexes()` on app startup.
 
-**On `employees` collection:**
-1. `emp_code` (unique = True)
-   - *Why:* Guarantees that employee codes can never be duplicated in the database. Also makes individual lookups like `db.employees.find_one({"emp_code": ...})` an index scan (O(1)) instead of scanning the whole collection.
-2. `[("department", ASCENDING), ("emp_code", ASCENDING)]`
-   - *Why:* In `GET /employees`, users filter by department and the spec requires sorting by `emp_code ASC`. Putting both in a compound index allows MongoDB to filter and return pre-sorted results without needing an in-memory sort stage.
-3. `joined_on`
-   - *Why:* Used when filtering employees by join date (for example in department summary analytics where we only count employees who joined on or before the month).
+**On the `employees` collection:**
 
-**On `attendance_logs` collection:**
-1. `[("emp_code", ASCENDING), ("date", ASCENDING)]` (unique = True)
-   - *Why:* Business rule R1 requires that an employee can have at most one attendance log per date. Making this a unique compound index enforces this guarantee at the database level and protects against simultaneous duplicate punch-ins.
-2. `[("date", DESCENDING), ("emp_code", ASCENDING)]`
-   - *Why:* Directly matches the default sorting requirement of `GET /attendance` (most recent date first, then by employee code). This avoids sorting in Python memory or slow collscans.
+1. **`emp_code` (unique = True)**
+   - **Why:** Guarantees that employee codes cannot be duplicated in the database. It also makes individual lookups like `db.employees.find_one({"emp_code": ...})` efficient by using an index instead of scanning the entire collection.
+
+2. **`[("department", ASCENDING), ("emp_code", ASCENDING)]`**
+   - **Why:** In `GET /employees`, users can filter by department, and the specification requires sorting by `emp_code ASC`. This compound index can help MongoDB filter employees by department and return results in the required order without an additional in-memory sort.
+
+3. **`joined_on`**
+   - **Why:** Supports queries that filter employees by their joining date, such as department summary analytics that count employees who joined on or before the end of the requested month.
+
+**On the `attendance_logs` collection:**
+
+1. **`[("emp_code", ASCENDING), ("date", ASCENDING)]` (unique = True)**
+   - **Why:** Business rule R1 requires that an employee can have at most one attendance log per date. The unique compound index enforces this rule at the database level and protects against duplicate records caused by concurrent punch-in requests.
+
+2. **`[("date", DESCENDING), ("emp_code", ASCENDING)]`**
+   - **Why:** Matches the default sorting requirement of `GET /attendance`, which returns the most recent date first and then sorts by employee code. This index can help MongoDB avoid an in-memory sort for compatible queries.
 
 **What I considered and rejected:**
-- I initially considered adding an index on `[("emp_code", ASCENDING), ("date", ASCENDING), ("status", ASCENDING)]` or indexing `status` by itself.
-- Why I rejected it: `status` only has a couple of distinct values (PRESENT, HALF_DAY, ABSENT), which means very low cardinality. The existing unique index on `(emp_code, date)` already narrows down any query to at most one record. Adding `status` as a third field would just increase write latency and index storage without helping our analytics queries (which mostly aggregate across date ranges or departments).
+
+- I initially considered adding an index on `[("emp_code", ASCENDING), ("date", ASCENDING), ("status", ASCENDING)]` or creating an index on `status` alone.
+- **Why I rejected it:** The `status` field has only a few possible values, such as `PRESENT`, `HALF_DAY`, and `ABSENT`, giving it low cardinality. The existing unique index on `(emp_code, date)` already efficiently identifies an employee's attendance record for a specific date. Adding `status` as a third field would increase index storage and write overhead without providing enough benefit for the current query patterns.
 
 ---
 
 ### 2. Punch-in race. Two identical punch-in requests arrive at the same instant. Walk through exactly what happens in your code.
 
-Here is the exact step-by-step of what happens if two identical punch-in requests hit the server at the exact same moment:
+Here is what happens when two identical punch-in requests reach the server concurrently:
 
-1. Both incoming HTTP requests enter the `punch_in` route concurrently.
-2. Both fetch the employee document using `db.employees.find_one({"emp_code": ...})` to check shift timings. Both find the employee successfully.
-3. Both convert the punch timestamp to IST and determine the shift date (e.g., `"2026-03-02"`).
-4. Both compute late minutes and prepare an attendance log document with `emp_code` and `date`.
-5. Both call `db.attendance_logs.insert_one(doc)`.
-6. At the database layer, MongoDB tries to insert the documents into the `attendance_logs` collection. Because of the unique compound index on `(emp_code, date)`, MongoDB's internal locking allows only the first insert to complete.
+1. Both incoming HTTP requests enter the `punch_in` route.
+2. Both fetch the employee document using `db.employees.find_one({"emp_code": ...})` to check the employee's shift timings. Both find the employee successfully.
+3. Both convert the punch timestamp to IST and determine the attendance date, for example, `"2026-03-02"`.
+4. Both calculate late minutes and prepare an attendance log document containing `emp_code` and `date`.
+5. Both attempt to insert their documents using `db.attendance_logs.insert_one(doc)`.
+6. At the database level, MongoDB enforces the unique compound index on `(emp_code, date)`. Only one of the two inserts can succeed for that employee and date.
 7. The first request succeeds and returns `201 Created` with the punch-in record.
-8. The second request immediately fails inside MongoDB with a `pymongo.errors.DuplicateKeyError` (error code 11000).
-9. In my code, I wrapped `insert_one` in a `try...except DuplicateKeyError:` block. When this error is caught, the code raises an `HTTPException(status_code=409, detail="Attendance log already exists for this date")`.
-10. The second request receives a `409 Conflict`.
+8. The second request fails with `pymongo.errors.DuplicateKeyError`, typically with error code `11000`.
+9. In my code, I wrapped `insert_one` in a `try...except DuplicateKeyError` block. When the exception is caught, the code raises an `HTTPException` with status code `409` and the detail `"Attendance log already exists for this date"`.
+10. The second request receives a `409 Conflict` response.
 
-*Note on my learning process:*
-When I first started, I thought I could just write:
+**Note on my learning process:**
+
+Initially, I thought I could prevent duplicate attendance records by checking whether a record already existed:
+
 `if db.attendance_logs.find_one({"emp_code": ..., "date": ...}): raise 409`
-Then I learned about "Time of Check to Time of Use" (TOCTOU) race conditions. If two requests run `find_one` at the same instant, both will see nothing in the db, both pass the check, and both attempt to insert. I used AI to understand how production systems handle concurrency without heavy locking, and learned that relying on database unique constraints is the standard pattern.
+
+However, I learned about **Time of Check to Time of Use (TOCTOU) race conditions**. If two requests perform the check at nearly the same time, both might find no existing record and then attempt to insert one.
+
+I used AI assistance and documentation to understand how production systems handle concurrency without relying on application-level locking. I learned that enforcing uniqueness at the database level is a reliable way to protect data integrity under concurrent requests.
 
 ---
 
 ### 3. Ties. Two employees are tied on late minutes at the cutoff of `limit`. What does your leaderboard return, and why?
 
 **What it returns:**
-Both tied employees are included in the response, even if the total number of returned rows exceeds `limit`.
 
-For example, if `limit = 10` and:
-- Rank 9: Employee A (45 late minutes)
-- Rank 10: Employee B (40 late minutes)
-- Rank 10: Employee C (40 late minutes)
-- Rank 12: Employee D (35 late minutes)
+Both tied employees are included in the response, even if the total number of returned employees exceeds `limit`.
 
-My endpoint returns all 11 employees (up to Employee C) because both Employee B and C share Rank 10, and both satisfy `rank <= limit`.
+For example, if `limit = 10` and the leaderboard contains:
+
+- Rank 9: Employee A — 45 late minutes
+- Rank 10: Employee B — 40 late minutes
+- Rank 10: Employee C — 40 late minutes
+- Rank 12: Employee D — 35 late minutes
+
+The endpoint returns 11 employees, including both Employee B and Employee C, because both have a rank less than or equal to 10. Employee D is excluded.
 
 **Why:**
-The problem statement and business rules specify standard competition ranking (often called "1224 ranking"). In competition ranking, tied items share the same rank, and the next rank is skipped. Furthermore, the requirement states that anyone whose rank is `<= limit` must be returned. Cutting off one of the tied employees arbitrarily just to force the list length to equal `limit` would be unfair and violate the ranking spec.
 
-*How I implemented it & AI assistance:*
-Doing tie-aware ranking on large datasets in Python memory is slow and prone to bugs with slicing. While reading about MongoDB capabilities, I learned about window functions introduced in Mongo 5.0+. Because I had never written a `$setWindowFields` pipeline before, I used AI to explain the syntax of `$setWindowFields` with the `$rank` operator vs `$denseRank`. Once I understood the difference (`$rank` skips ranks after ties, which is what 1224 ranking requires), I built the aggregation pipeline:
-1. `$match` on date range and `late_minutes > 0`.
+The business rules specify **standard competition ranking**, commonly represented by the sequence `1, 2, 2, 4`.
+
+Employees with equal scores share the same rank, and the next rank is skipped. The requirement also states that anyone whose rank is `<= limit` must be returned.
+
+Excluding one tied employee simply to force the response to contain exactly `limit` rows would violate this requirement.
+
+**How I implemented it and what I learned:**
+
+Calculating tie-aware rankings in Python memory can become inefficient and error-prone as the dataset grows. While exploring MongoDB aggregation capabilities, I learned about `$setWindowFields` and the `$rank` and `$denseRank` operators.
+
+I used AI assistance to understand their syntax and differences. The `$rank` operator supports standard competition ranking, while `$denseRank` does not skip rank numbers after ties.
+
+My aggregation pipeline follows these steps:
+
+1. `$match` on the date range and `late_minutes > 0`.
 2. `$group` by employee to calculate total late minutes.
 3. `$sort` by `late_minutes DESC, emp_code ASC`.
-4. `$setWindowFields` to assign competition `$rank`.
+4. `$setWindowFields` to assign competition ranks.
 5. `$match` where `rank <= limit`.
+
+This approach implements the required tie-handling behavior through MongoDB aggregation.
 
 ---
 
 ### 4. Headcount. How does your department summary make sure employees with zero logs are counted?
 
-The most common trap in attendance reporting is starting the aggregation from `attendance_logs`. If an employee was absent the whole month, on long leave, or simply never punched in, they will have zero records in `attendance_logs`. If you query `attendance_logs`, that employee is invisible and your department headcount will be wrong.
+A common problem in attendance reporting is starting the aggregation from the `attendance_logs` collection. Employees who never punched in during a month would have no attendance records and could therefore be omitted from the report.
 
 **How I solved it:**
-1. I started the query from the **`employees`** collection, not `attendance_logs`.
-2. I filter `employees` by `department` and make sure their `joined_on` date is on or before the last day of the requested month. This gives the true total headcount of people employed in that department during that month.
-3. Then I use a `$lookup` stage (equivalent to a SQL LEFT JOIN) to pull in any matching attendance logs from `attendance_logs` where `emp_code` matches and the log's `date` falls within the target month.
-4. If an employee has zero punches in that month, the `$lookup` simply returns an empty array `[]`.
-5. When computing department totals, that employee is still counted in the total headcount (`total_employees`), but contributes 0 to present days or late days.
 
-This guarantees that even if nobody in a department showed up for the entire month, the department summary still correctly reports the active employee headcount.
+1. I started the aggregation from the `employees` collection rather than `attendance_logs`.
+2. I filtered employees by department and ensured their `joined_on` date was on or before the last day of the requested month. This establishes the eligible employee headcount for that month, assuming the dataset does not require accounting for termination dates.
+3. I used a `$lookup` stage, equivalent to a SQL `LEFT JOIN`, to find matching attendance logs where `emp_code` matches and the log's `date` falls within the requested month.
+4. If an employee has no attendance logs during that month, the `$lookup` returns an empty array, `[]`.
+5. The employee is still included in the total headcount, but contributes zero to the attendance counts derived from their logs.
+
+This approach ensures that employees with zero attendance logs are not automatically excluded from department headcount calculations.
 
 ---
 
 ### 5. One thing you would change if this had to serve 100x the data.
 
-Right now, in the department trend endpoint (`/analytics/departments/{department}/trend`), the logic fetches the logs within the date range (up to 92 days) and computes the day-by-day attendance counts, gap-filling for missing dates, and the 7-day rolling average in Python memory.
+Currently, in the department trend endpoint (`/analytics/departments/{department}/trend`), the application fetches attendance logs within the requested date range, up to 92 days, and calculates daily attendance counts, fills missing dates, and computes the seven-day rolling average in Python memory.
 
-For the current scope and small departments this works fine. But if data grew by 100x (say 50,000 employees per department and millions of attendance records):
-- Fetching raw punch records across a whole department into the FastAPI application memory would cause high CPU and RAM usage, and create high latency.
+For the current scope and smaller departments, this approach is manageable. However, if the dataset grew by 100 times, for example, to 50,000 employees per department and millions of attendance records, fetching and processing raw attendance logs in the FastAPI application could increase CPU usage, memory consumption, and response latency.
 
 **What I would change:**
-I would introduce **daily pre-aggregated attendance rollups**:
-- Either via a daily scheduled background job (or a MongoDB scheduled trigger) running at midnight, or updating a `daily_department_stats` collection incrementally whenever a punch occurs.
-- The `daily_department_stats` collection would store pre-calculated numbers: `{ department, date, headcount, present_count, late_count }`.
-- When a user calls `/analytics/departments/{department}/trend`, instead of scanning raw logs for thousands of workers across 90 days, the query only needs to read ~90 pre-calculated daily summary documents. Computing a 7-day rolling average over 90 numbers is instantaneous.
 
-*Concepts I explored with AI:*
-I also researched whether MongoDB could do this on-the-fly using pipeline operators like `$densify` (to fill missing dates) and `$movingAverage`. AI explained how these operators work in MongoDB 5.0+. While powerful, for 100x data scale, pre-aggregating daily rollups is the more practical architectural decision because it turns an expensive multi-record calculation into an O(N_days) lookup.
+I would introduce **daily pre-aggregated attendance rollups**.
+
+These could be maintained through a scheduled background job or updated incrementally when attendance records are created. A separate `daily_department_stats` collection could store pre-calculated values such as:
+
+`{ department, date, headcount, present_count, late_count }`
+
+When a user calls `/analytics/departments/{department}/trend`, the application would retrieve approximately 90 daily summary documents instead of processing all the underlying attendance records. It could then calculate the seven-day rolling average over those daily values.
+
+The implementation would need to handle corrections, duplicate events, and changes to employee headcount so that the summaries remain accurate.
+
+**Concepts I explored with AI:**
+
+I also explored MongoDB aggregation operators such as `$densify` and `$setWindowFields` for filling date gaps and calculating rolling statistics. MongoDB provides these capabilities in supported versions, although the exact availability of individual operators depends on the server version.
+
+While these operators can simplify on-demand analytics, I believe pre-aggregated daily rollups would be a practical architectural improvement at a substantially larger scale because they reduce the amount of raw data processed for each trend request.
+
+---
+
+### 6. API Testing. How did you test your endpoints?
+
+I used **Swagger UI** to interact with and test the FastAPI endpoints during development.
+
+- Opened Swagger UI at `/docs` to explore the available endpoints and their request and response schemas.
+- Sent API requests directly from the browser to check endpoint behavior.
+- Inspected HTTP status codes and response bodies to understand the results of successful requests and errors.
+- Used the interactive interface to provide request parameters and JSON payloads where required.
+- Used the feedback from these tests to identify and troubleshoot API implementation issues during development.
+
+Swagger UI made it convenient to explore and test the API without having to manually construct every HTTP request in a separate tool.
+
+**What I learned:**
+
+I learned how API documentation can also serve as an interactive testing interface. It helped me understand the relationship between request schemas, input validation, HTTP status codes, and API responses.
+
+Swagger UI was useful during development because it allowed me to test endpoints directly and inspect their behavior as I built the application.

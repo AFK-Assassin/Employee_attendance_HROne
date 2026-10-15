@@ -46,3 +46,16 @@ Since I am relatively early in my backend journey, I approached this systematica
    - **Python Rounding vs Math Rounding:** I did not know Python's `round()` uses Banker's rounding (round-to-even) by default. Once I learned why `round(8.445, 2)` gave `8.44`, I looked up how to do half-up rounding. I used AI to verify the exact syntax using `decimal.Decimal(str(val)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)`.
    - **Overnight shifts across midnight in IST:** Mapping punch times to the correct shift date when employees work past midnight was tricky to think through. I mapped out the cases on paper (e.g., punch in at 00:30 for a 22:00-06:00 shift belongs to yesterday) and used AI to help double-check my date calculation logic.
    - **MongoDB aggregation pipelines:** For the analytics endpoints and leaderboard ties, I learned about `$setWindowFields` and `$rank` rather than trying to pull everything into memory. AI helped me understand the aggregation pipeline structure so I could write and test it properly.
+
+
+### Note on Code Structure & Architecture
+
+One observation while working through this codebase is that having everything in a single `app/main.py` file feels very congested. When schemas, routing, business logic, timezone math, and database queries all live in one 900+ line file, it's easy for errors to hide and for small edits to accidentally break another part of the file.
+
+I followed the instructions and kept all code in `app/main.py` to ensure compatibility with the automated grading kit. However, in a real-world production system, it would be much better to use a modular / MVC-style architecture (similar to how Express/MERN applications are organized):
+- **Routers (`routers/`):** Using FastAPI's `APIRouter` to split routes by domain (e.g., `employees.py`, `attendance.py`, `analytics.py`) instead of attaching everything directly to `app`.
+- **Schemas / Models (`schemas/`):** Grouping Pydantic request and response models into dedicated files.
+- **Controllers / Services (`services/`):** Isolating business logic, rounding rules, and MongoDB aggregation pipelines away from the route definitions.
+- **Utils (`utils/`):** Keeping timezone conversions, shift time calculations, and helper functions in separate, easily testable utility files.
+
+Breaking the project into an MVC-style folder structure makes the code easier to navigate, simplifies unit testing, and prevents the congestion that comes with single-file backends.

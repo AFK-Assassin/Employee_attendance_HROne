@@ -9,11 +9,14 @@ works, but nobody has reviewed it. Read PROBLEM_STATEMENT.docx for what is expec
 openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
 import os
+import calendar
+import json
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+from bson import json_util
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import FastAPI, HTTPException, Response, Query
 from pymongo import MongoClient, ASCENDING, DESCENDING
 from pymongo.errors import DuplicateKeyError
 from pydantic import BaseModel
@@ -847,10 +850,10 @@ def explain_endpoint(
         if status:
             q["status"] = status
         skip = (page - 1) * page_size
-        explain = db.attendance_logs.find(q).sort(
+        raw_explain = db.attendance_logs.find(q).sort(
             [("date", DESCENDING), ("emp_code", ASCENDING)]
         ).skip(skip).limit(page_size).explain()
-        return {"endpoint": endpoint, "collection": "attendance_logs", "explain": explain}
+        return {"endpoint": endpoint, "collection": "attendance_logs", "explain": json.loads(json_util.dumps(raw_explain))}
 
     elif endpoint == "employee_monthly":
         if not emp_code or not month:
@@ -862,8 +865,10 @@ def explain_endpoint(
         pipeline = [
             {"$match": {"emp_code": emp_code, "date": {"$gte": month_start, "$lte": month_end}}},
         ]
-        explain = db.attendance_logs.aggregate(pipeline, explain=True)
-        return {"endpoint": endpoint, "collection": "attendance_logs", "explain": explain}
+        raw_explain = db.command(
+            {"explain": {"aggregate": "attendance_logs", "pipeline": pipeline, "cursor": {}}, "verbosity": "executionStats"}
+        )
+        return {"endpoint": endpoint, "collection": "attendance_logs", "explain": json.loads(json_util.dumps(raw_explain))}
 
     elif endpoint == "department_summary":
         if not month:
@@ -875,8 +880,10 @@ def explain_endpoint(
         if department:
             emp_match["department"] = department
         pipeline = [{"$match": emp_match}]
-        explain = db.employees.aggregate(pipeline, explain=True)
-        return {"endpoint": endpoint, "collection": "employees", "explain": explain}
+        raw_explain = db.command(
+            {"explain": {"aggregate": "employees", "pipeline": pipeline, "cursor": {}}, "verbosity": "executionStats"}
+        )
+        return {"endpoint": endpoint, "collection": "employees", "explain": json.loads(json_util.dumps(raw_explain))}
 
     elif endpoint == "late_leaderboard":
         if not month:
@@ -888,15 +895,17 @@ def explain_endpoint(
         pipeline = [
             {"$match": {"date": {"$gte": month_start, "$lte": month_end}, "late_minutes": {"$gt": 0}}},
         ]
-        explain = db.attendance_logs.aggregate(pipeline, explain=True)
-        return {"endpoint": endpoint, "collection": "attendance_logs", "explain": explain}
+        raw_explain = db.command(
+            {"explain": {"aggregate": "attendance_logs", "pipeline": pipeline, "cursor": {}}, "verbosity": "executionStats"}
+        )
+        return {"endpoint": endpoint, "collection": "attendance_logs", "explain": json.loads(json_util.dumps(raw_explain))}
 
     elif endpoint == "department_trend":
         if not department or not from_ or not to:
             raise HTTPException(422, "department, from, and to are required")
         dept_emps = [e["emp_code"] for e in db.employees.find({"department": department}, {"emp_code": 1})]
-        explain = db.attendance_logs.find(
+        raw_explain = db.attendance_logs.find(
             {"date": {"$gte": from_, "$lte": to}, "emp_code": {"$in": dept_emps}}
         ).explain()
-        return {"endpoint": endpoint, "collection": "attendance_logs", "explain": explain}
+        return {"endpoint": endpoint, "collection": "attendance_logs", "explain": json.loads(json_util.dumps(raw_explain))}
 
